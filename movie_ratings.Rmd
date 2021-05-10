@@ -1,0 +1,791 @@
+---
+title: "edx Capstone - Movielens"
+author: "Saigopal"
+date: "5/7/2021"
+output: pdf_document
+fontsize: 10pt
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, comment = NA)
+memory.limit(size = 40000)
+```
+```{r data download and required packages}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(amap)) install.packages("amap", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+library(amap)
+library(knitr)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+# 1. Introduction
+
+This report is prepared for the edx Data Science: Capstone project - the final course in HarvardX's Data Science Professional Certificate series. The assignment is based on the Netflix challenge of improving a recommendation system. 
+
+Recommendation system is one where User's rate their experience on a specific product, which could be a movie or food or any products, to express their satisfaction. It is usually measured in ordered scale with high value indicating satisfaction and are used by several industry [Netflix, Amazon, Youtube, Food delivery industries etc..] for targeted advertisements of their products to customers. It also improves user's satisfaction.
+
+The goal of this assignment is to develop a model that reduce the error for predicted ratings. The script to download the data was provided in the project introduction section of the course. The script also included some preliminary wrangling of the data and splitting of the data into edx and validation datasets.
+
+The edx dataset had nine million rows/observations. There were six column variables, including the outcome variable "rating". The other five variables were userId, movieId, title of the movie, genre(s) of the movie and timestamp in seconds. There were no missing values in the dataset.
+
+```{r data structure, echo=TRUE}
+dim(edx)
+head(edx, n =4)
+any(is.na(edx))
+```
+
+Key steps done in this analysis includes
+
++ Creating new variables from the data and exploring their relation with outcome
++ Hierarchical Clustering using correlation distance and grouping of movies
++ Least square estimation of rating with movie clusters and other predictors identified along with movie and user bias 
+
+These are explained in detail section 2 and 3 respectively.
+
+# 2. Methods and Analysis
+
+The unit of observation in this analysis is a user/movie pair.
+
+The number of unique user's and movie's in the edx dataset is shown below. The other two tables displays the number of user's and movie's in the bottom five, middle ninety and top five in terms of number of ratings, the total number of ratings between them and the proportion of observations in the data they represent.
+
+```{r user and movie distribution}
+cat("Number of User's =", n_distinct(edx$userId))   
+
+cat("Number of Movie's = ", n_distinct(edx$movieId)) 
+
+edx_user_dat<- edx %>% group_by(userId) %>% 
+  summarise(number_rated = n()) %>%           
+  mutate(Group = case_when(
+    number_rated < quantile(number_rated, probs = 0.05) ~ "Bottom five",
+    number_rated > quantile(number_rated, probs = 0.95) ~ "Top five"
+  ))
+    
+edx_user_dat<- edx_user_dat %>%
+  mutate(Group = ifelse(is.na(Group), "Middle ninety", Group)) 
+
+
+edx_movie_dat<- edx %>% group_by(movieId) %>%                  
+  summarise(number_rated = n()) %>%           
+  mutate(Group = case_when(
+    number_rated < quantile(number_rated, probs = 0.05) ~ "Bottom five",
+    number_rated > quantile(number_rated, probs = 0.95) ~ "Top five"
+  ))
+
+edx_movie_dat<- edx_movie_dat %>%                             
+  mutate(Group = ifelse(is.na(Group), "Middle ninety", Group)) 
+
+cat("User's Distribution in dataset") 
+edx_user_dat %>% group_by(Group) %>%  
+  summarise(number = n(), total_ratings = sum(number_rated)) %>%
+  mutate(percentage_dataset = total_ratings/nrow(edx)) %>% kable()
+
+cat("Movies's Distribution in dataset") 
+edx_movie_dat %>% group_by(Group) %>% 
+  summarise(number = n(), total_ratings = sum(number_rated)) %>%
+  mutate(percentage_dataset = total_ratings/nrow(edx)) %>% kable()
+```
+
+The distribution of user's and movie's in the dataset is heavily skewed with less than 5% of the movies contributing more than 50% of the data and 5% of the users making up 30% of the data. This 5% of (534) movies will be included in hierarchical clustering analysis in Section 2.2.2.
+
+## 2.1 Creating new variables form timestamp column
+
+Timestamp were stored in seconds since epoch - 1 January 1970. Two variables were created using this, the year a movie was rated and the day of the week the movie was rated. This was done using the year and as_datetime function's of the lubridate package and weekday function of base R.
+
+Distribution of rating by year is shown in the figure (dot inside the box is mean rating) and the average rating by day of the week is summarized in table below.
+
+```{r rating year and day of week data}
+edx<- edx %>% mutate(rating_year = year(as_datetime(timestamp)), 
+                     day_week = weekdays(as_datetime(timestamp)))
+
+edx %>% ggplot(aes(x = factor(rating_year), y = rating)) +
+  geom_boxplot() + ylab("Ratings") + xlab("Rating Year") +
+  ggtitle("Distribution of Rating by Rating Year") +
+  stat_summary(fun = mean, geom="point", size = 1, col = "brown") + 
+  theme_minimal()
+
+edx$day_week<- factor(edx$day_week, levels = c("Monday", "Tuesday", "Wednesday",
+                                               "Thursday", "Friday", "Saturday",
+                                               "Sunday")) # 
+
+edx %>% group_by(day_week) %>%
+  summarise(Number = n(), Mean = mean(rating), SD = sd(rating)) %>% kable() 
+```
+
+There are only `r sum(edx$rating_year == 1995)` observations for the year 1995. The average rating across years do not appear to change much. For average rating by day of week, there is a slight increase in Saturday and a decrease in Wednesday and Thursday. But these difference are very small about 0.01.
+
+Both these variables are not considered for inclusion in the model.
+
+## 2.2 Creating new variables from title column
+
+Several new variables were created using this column. The year a movie was released and clusters of movies with similar rating pattern.
+
+### 2.2.1 Year a Movie released
+
+The year a movie released was captured in the title column at the end of the title inside parenthesis. To extract these, the regex pattern shown below was used.
+
+```{r regex for movie release year, echo=TRUE}
+film_year_pattern<- "\\(19[0-9][0-9]\\)|\\(20[0-9][0-9]\\)"
+```
+
+This regex is explained as a string that must start and end with parenthesis. The first two character inside the parenthesis can be 19 or 20 and the next two characters can be any number. This was extracted using str_extract function and the parenthesis removed using str_remove and the character converted to numeric.
+
+The average rating of films by the year they released was explored and there was no linear relationship observed. The movies released after the year 1980 (inclusive) appeared to have a lower average than those released before (dots on right side of the dashed line - See Figure below). A new binary variable (film_1980) was created to captures this grouping (0 = movies before 1980 and 1 = after).
+
+The mean rating in these two groups is shown below the figure. This binary variable will be included in the regression model.
+
+```{r year the film released}
+edx<- edx %>% mutate(film_year = str_extract(title, pattern = film_year_pattern)) %>% 
+  mutate(film_year = str_remove(film_year, pattern = "\\(")) %>%        
+  mutate(film_year = as.numeric(str_remove(film_year, pattern = "\\)")))
+
+edx %>% group_by(film_year) %>% 
+  summarise(avg_rating = mean(rating), number_movies = n()) %>% 
+  ggplot(aes(x = film_year, y = avg_rating)) + 
+  geom_point(aes(size = sqrt(number_movies)), alpha = 0.2) +          
+  ylab("Average Rating") + xlab("Year Film Released") +               
+  ggtitle("Avearge Rating Vs Year Movie Released") +                  
+  scale_x_continuous(breaks = seq(from = 1910, to = 2010, by = 10)) +  
+  geom_vline(xintercept = 1980, col = "brown", lty = "dashed") +     
+  scale_size_continuous(name = "Number of Movies (Sqrt)") +           
+  geom_smooth(method = "lm", col = "orange") + theme_minimal() 
+
+edx<- edx %>% mutate(film_1980 = ifelse(film_year > 1980, 1, 0))
+average_before_1980<- mean(edx$rating[edx$film_1980 == 0])
+average_after_1980<- mean(edx$rating[edx$film_1980 == 1])
+
+cat("Mean rating: Movies before 1980 = ", average_before_1980)
+cat("Mean rating: Movies after 1980 = ", average_after_1980)
+```
+
+### 2.2.2 Hierarchical Clustering analysis
+
+Clustering analysis was done to identify movie clusters to be included in the regression model. Correlation distance was calculated using the Dist function of the **amap** package and for clustering, the hclust function was used with _Ward method_. 
+
+Ward’s minimum variance method minimize the within the group variation <https://uc-r.github.io/hc_clustering>, thereby the cluster would be movies with very similar rating pattern. The movies which were rated many times (> 95th percentile) and users who have rated more than 50 times are used for this analysis.
+
+The tree was cut by visualization of the dendrogram at a height of 2.7 forming eight movie groups (See Figure below)
+
+```{r cluster analysis, fig.asp=0.62}
+movies_index<- edx %>% group_by(movieId) %>%
+  summarise(number_rated = n()) %>%
+  filter(number_rated > quantile(number_rated, probs = 0.95)) %>%
+  pull(movieId)                         
+
+cluster_dat<-edx %>% filter(movieId %in% movies_index) %>%
+  group_by(userId) %>%
+  filter(n() > 50) %>% ungroup() %>%     
+  select(title, userId, rating) %>%
+  spread(key = userId, value = rating)   
+row_names <- cluster_dat$title
+cluster_matrix <- cluster_dat[,- 1] %>% as.matrix() 
+cluster_matrix <- sweep(cluster_matrix, 2, colMeans(cluster_matrix, na.rm = TRUE)) 
+cluster_matrix <- sweep(cluster_matrix, 1, rowMeans(cluster_matrix, na.rm = TRUE)) 
+rownames(cluster_matrix) <- row_names 
+
+d<- Dist(cluster_matrix, method = "correlation") 
+h<- hclust(d, method = "ward.D2") 
+plot(h, cex = 0.05, ann = F, main = "Cluster Dendrogram") 
+abline(h = 2.7, lty = "dashed", col = "brown") 
+movies_clusters <- cutree(h, h = 2.7) 
+
+g1<- names(movies_clusters)[movies_clusters==1]
+g2<- names(movies_clusters)[movies_clusters==2]
+g3<- names(movies_clusters)[movies_clusters==3]
+g4<- names(movies_clusters)[movies_clusters==4]
+g5<- names(movies_clusters)[movies_clusters==5]
+g6<- names(movies_clusters)[movies_clusters==6]
+g7<- names(movies_clusters)[movies_clusters==7]
+g8<- names(movies_clusters)[movies_clusters==8]
+
+table(movies_clusters)
+
+remove(cluster_dat, cluster_matrix, movies_index, movies_clusters, d, h, row_names)
+```
+
+Patterns in the eight group can be identified by movie names. The groupings which were discussed in the course can be seen in the groups. Some examples below.
+
+```{r cluster examples, echo=TRUE}
+
+g3[str_detect(g3, "Donnie Br|Godfa|Goodfe|Carlito|Heat|Casino")] 
+
+g5[c(22,29,36,10,6,12)]
+```
+
+The distribution of the ratings across these groups are displayed below.
+
+```{r rating by movie groups}
+edx<- edx %>% mutate(groups = case_when(
+  title %in% g1 ~ "Group 1",
+  title %in% g2 ~ "Group 2",
+  title %in% g3 ~ "Group 3",
+  title %in% g4 ~ "Group 4",
+  title %in% g5 ~ "Group 5",
+  title %in% g6 ~ "Group 6",
+  title %in% g7 ~ "Group 7",
+  title %in% g8 ~ "Group 8"
+))
+
+edx<- edx %>% mutate(groups = factor(ifelse(is.na(groups), "Group 0", groups)))
+
+edx %>% ggplot(aes(x = groups, y = rating)) + 
+  geom_boxplot() + xlab("Movie Cluster") +
+  ylab("Rating") + ggtitle("Distribution of Rating by Groups") +
+  stat_summary(fun = mean, geom="point", shape = 1, size = 2) +
+  theme_minimal()
+
+edx<- edx %>%
+  mutate(group1 = ifelse(title %in% g1, 1, 0),
+         group2 = ifelse(title %in% g2, 1, 0),
+         group3 = ifelse(title %in% g3, 1, 0),
+         group4 = ifelse(title %in% g4, 1, 0),
+         group5 = ifelse(title %in% g5, 1, 0),
+         group6 = ifelse(title %in% g6, 1, 0),
+         group7 = ifelse(title %in% g7, 1, 0),
+         group8 = ifelse(title %in% g8, 1, 0)) 
+```
+
+These eight groups were binarized (0s = No and 1s = Yes) for model building and all eight are included in the model. The reason for 0 and 1 are explained in Section 3.
+
+## 2.3 Creating new variables from genre column
+
+All the unique genre were first identified by using the str_split function of the stringr package and unique function of base R. There were 19 unique genres and a element no genres listed. 
+
+```{r unique genres, echo=TRUE}
+unique(unlist(str_split(edx$genres, pattern = "\\|"))) 
+```
+
+Binary variables were created for each of the nineteen genres. The average rating within these genres are tabulated below.
+
+```{r mean rating by genre}
+edx<- edx %>% mutate(comedy = ifelse(str_detect(genres, pattern = "Comedy"), 1, 0),  
+                     romance = ifelse(str_detect(genres, pattern = "Romance"), 1, 0), 
+                     action = ifelse(str_detect(genres, pattern = "Action"), 1, 0), 
+                     crime = ifelse(str_detect(genres, pattern = "Crime"), 1, 0),
+                     thriller = ifelse(str_detect(genres, pattern = "Thriller"), 1, 0),
+                     drama = ifelse(str_detect(genres, pattern = "Drama"), 1, 0),
+                     sci_fi = ifelse(str_detect(genres, pattern = "Sci-Fi"), 1, 0),
+                     adventure = ifelse(str_detect(genres, pattern = "Adventure"), 1, 0),
+                     children = ifelse(str_detect(genres, pattern = "Children"), 1, 0),
+                     fantasy = ifelse(str_detect(genres, pattern = "Fantasy"), 1, 0),
+                     war = ifelse(str_detect(genres, pattern = "War"), 1, 0),
+                     animation = ifelse(str_detect(genres, pattern = "Animation"), 1, 0),
+                     musical = ifelse(str_detect(genres, pattern = "Musical"), 1, 0),
+                     western = ifelse(str_detect(genres, pattern = "Western"), 1, 0),
+                     mystery = ifelse(str_detect(genres, pattern = "Mystery"), 1, 0),
+                     film_noir = ifelse(str_detect(genres, pattern = "Film-Noir"), 1, 0),
+                     horror = ifelse(str_detect(genres, pattern = "Horror"), 1, 0),
+                     documentary = ifelse(str_detect(genres, pattern = "Documentary"), 1, 0),
+                     imax = ifelse(str_detect(genres, pattern = "IMAX"), 1, 0))
+rbind(edx %>% group_by(comedy) %>% summarise(Genre = "Comedy", Mu = mean(rating)) %>%
+        spread(key = comedy, value = Mu), 
+      
+      edx %>% group_by(romance) %>% summarise(Genre = "Romance", Mu = mean(rating)) %>%
+        spread(key = romance, value = Mu),
+      
+      edx %>% group_by(action) %>% summarise(Genre = "Action", Mu = mean(rating)) %>%
+        spread(key = action, value = Mu),
+      
+      edx %>% group_by(crime) %>% summarise(Genre = "Crime", Mu = mean(rating)) %>%
+        spread(key = crime, value = Mu),
+      
+      edx %>% group_by(thriller) %>% summarise(Genre = "Thriller", Mu = mean(rating)) %>%
+        spread(key = thriller, value = Mu),
+      
+      edx %>% group_by(drama) %>% summarise(Genre = "Drama", Mu = mean(rating)) %>%
+        spread(key = drama, value = Mu),
+      
+      edx %>% group_by(sci_fi) %>% summarise(Genre = "Sci-Fi", Mu = mean(rating)) %>%
+        spread(key = sci_fi, value = Mu),
+      
+      edx %>% group_by(adventure) %>% summarise(Genre = "Adventure", Mu = mean(rating)) %>%
+        spread(key = adventure, value = Mu),
+      
+      edx %>% group_by(children) %>% summarise(Genre = "Children", Mu = mean(rating)) %>%
+        spread(key = children, value = Mu),
+      
+      edx %>% group_by(fantasy) %>% summarise(Genre = "Fantasy", Mu = mean(rating)) %>%
+        spread(key = fantasy, value = Mu),
+      
+      edx %>% group_by(war) %>% summarise(Genre = "War", Mu = mean(rating)) %>%
+        spread(key = war, value = Mu),
+      
+      edx %>% group_by(animation) %>% summarise(Genre = "Animation", Mu = mean(rating)) %>%
+        spread(key = animation, value = Mu),
+      
+      edx %>% group_by(musical) %>% summarise(Genre = "Musical", Mu = mean(rating)) %>%
+        spread(key = musical, value = Mu),
+      
+      edx %>% group_by(western) %>% summarise(Genre = "Western", Mu = mean(rating)) %>%
+        spread(key = western, value = Mu),
+      
+      edx %>% group_by(mystery) %>% summarise(Genre = "Mystery", Mu = mean(rating)) %>%
+        spread(key = mystery, value = Mu),
+      
+      edx %>% group_by(film_noir) %>% summarise(Genre = "Film-Noir", Mu = mean(rating)) %>%
+        spread(key = film_noir, value = Mu),
+      
+      edx %>% group_by(horror) %>% summarise(Genre = "Horror", Mu = mean(rating)) %>%
+        spread(key = horror, value = Mu),
+      
+      edx %>% group_by(documentary) %>% summarise(Genre = "Documentary", Mu = mean(rating)) %>%
+        spread(key = documentary, value = Mu),
+      
+      edx %>% group_by(imax) %>% summarise(Genre = "IMAX", Mu = mean(rating)) %>%
+        spread(key = imax, value = Mu)) %>% rename(No = '0', Yes = '1') %>%
+  
+  mutate(Difference = Yes - No) %>% arrange(desc(abs(Difference))) %>% kable()
+
+```
+
+Although some genres had difference of less than 0.1, all the genre are included as predictors in the model. The reason for this is most movies were categorized in multiple genre's and a additive relationship is assumed in the model to be built.
+
+# 3. Results
+
+A linear regression model is chosen for this assignment. This model _builds on the model_ described in the eighth course. Key difference between the two models are listed below.
+
++ Instead of **Naive Mu**, the Least Square Estimate **[LSE] Mu** is used
+
++ The predictors for the linear regression are film_1980s (the film released before 1980 or after), movie cluster/group 1 through 8 and all of the 19 genres, meaning the _year, genre and the cluster effect_ are added to the model
+
+Matrix algebra is used to solve the least square equation, as it is much quicker than lm function. The connection between matrix algebra and LSE is shown in a small example for reviewer's not familiar with matrix algebra.
+
+```{r LSE with matrix, echo=TRUE, collapse=TRUE}
+dat<- data.frame(x1 = c(rep("Yes", 4), rep("No", 4)), y =rnorm(8))
+dat
+
+lm(y ~ x1, data = dat)$coeff
+
+y<- dat$y
+
+X<- dat %>% mutate(x1 = ifelse(x1 == "Yes", 1, 0), intercept = 1) %>% 
+  select(x1, intercept) %>% as.matrix()
+X
+
+betahats<- solve(crossprod(X)) %*% crossprod(X, y)
+
+betahats
+remove(X, y, dat, betahats)
+```
+
+The coefficients are the same. The order of the intercept do not matter. For prediction, the test set will be converted into a matrix containing the predictors to be included in the model with intercept (a column of 1's) and multiplied by the betahats. The R scripts for the LSE model are printed in the document for ease of review.
+
+## 3.1 Model building and evaluation
+
+The **edx dataset** was split into train and test set. The number of observations in the test test was 900 thousand. The train set had 8 million observations. The reason for this choice was to train the model with a sufficiently large number so that the standard error will be negligible and the model metric can be evaluated in a dataset with number similar to the final validation set.
+
+The Residual Mean Square Error (RMSE) was used to evaluate model performance. The Naive Mu model explained in course is compared along to gauge the performance of this LSE model to be used here.
+
+```{r edx data partition}
+set.seed(27, sample.kind="Rounding") 
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.10, list = FALSE)
+train_set <- edx[-test_index,]
+temp <- edx[test_index,]
+
+test_set <- temp %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+removed <- anti_join(temp, test_set)
+train_set<- rbind(train_set, removed)
+rm(temp, test_index, removed)
+```
+
+```{r observation in train and test, echo=TRUE}
+dim(train_set) # number of rows and number of columns
+dim(test_set)
+```
+
+## 3.2 RMSE without Movie and User Bias
+
+The RMSE of the Naive Mu model is presented below. 
+
+```{r naive mu model without bias}
+
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+true_ratings<- test_set$rating
+
+train_mu<- mean(train_set$rating)
+
+rmse<- RMSE(true_ratings = true_ratings, predicted_ratings = train_mu)
+
+models<- data.frame(Model = "Null model (Naive Mu)", RMSE = rmse)
+
+models
+```
+
+The RMSE of the LSE model is computed by the following script.
+
+```{r LSE mu without bias, echo=TRUE}
+
+true_ratings<- test_set$rating
+
+y<- train_set$rating
+
+X<- train_set %>% mutate(intercept = 1) %>% 
+  select(10, 12:39) %>% as.matrix() # column 10 is film_year, 12 to 38 are
+                                    # movie cluster and genres, 39 intercept
+
+test_matrix<- test_set %>% mutate(intercept = 1) %>%
+  select(10, 12:39) %>% as.matrix()
+
+betahats<- solve(crossprod(X)) %*% crossprod(X, y)
+
+predicted_ratings<- test_matrix %*% betahats
+
+rmse<- RMSE(true_ratings = true_ratings, predicted_ratings = predicted_ratings)
+
+models<- rbind(models, c("LSE Mu", rmse))
+
+remove(X, test_matrix, rmse, predicted_ratings)
+
+models
+```
+
+A big difference in RMSE between models, around 0.05. The 10 largest coefficient/effects are listed below.
+
+```{r lse without bias betahats}
+coef_names<- names(train_set)[c(10, 12:38)]
+coef_names<- c(coef_names, "intercept")
+dat<- data.frame(ceoffs_name = coef_names, estimate = betahats)
+dat %>% filter(estimate > 0.3 | estimate < - 0.3) %>% arrange(desc(abs(estimate)))
+remove(coef_names, dat, betahats)
+```
+
+These coefficients can be interpreted. Examples- for a movie with no genre, released before 1980 and is not part of any of the eight group, the intercept will be the predicted rating. For a IMAX movie in group 1 released after 1980, the predicted rating would be: intercept + 0.36312 (IMAX coeff) + 0.31089 (group1 coeff) - 0.3607968 (film_1980 coeff).
+
+## 3.3 RMSE with Movie and User Bias
+
+In this section, the movie bias (b_i) and user bias (b_u) are added to both models. The RMSE of the Naive Mu model with Movie and User bias is shown below.
+
+```{r naive mu RMSE with bias}
+train_movie_avgs <- train_set %>% select(movieId, userId, rating) %>%
+  group_by(movieId) %>%
+  summarize(b_i = mean(rating - train_mu))
+
+train_user_avgs <- train_set %>% select(movieId, userId, rating) %>%
+  left_join(train_movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - train_mu - b_i))
+
+predicted_ratings <- test_set %>% select(movieId, userId, rating) %>%
+  left_join(train_movie_avgs, by='movieId') %>%
+  left_join(train_user_avgs, by='userId') %>%
+  mutate(pred = train_mu + b_i + b_u) %>%
+  pull(pred)
+
+rmse<- RMSE(true_ratings = true_ratings, predicted_ratings = predicted_ratings)
+
+models<- rbind(models, c("Naive Mu + Movie bias + User bias", rmse))
+
+remove(train_movie_avgs, train_user_avgs, predicted_ratings, rmse)
+
+models
+```
+
+A big drop is seen after adding the movie and user bias. The predicted rating and RMSE for the LSE model was calculated next using the script below.
+
+```{r LSE Mu with movie and user bias, echo=TRUE}
+
+train_mu<- mean(train_set$rating)
+
+train_bi <- train_set %>% select(userId, movieId, rating) %>%
+  group_by(movieId) %>% summarise(b_i = mean(rating - train_mu))
+
+train_bu<- train_set %>% select(userId, movieId, rating) %>%
+  left_join(train_bi, by="movieId") %>%
+  group_by(userId) %>% summarise(b_u = mean(rating - train_mu - b_i))
+
+
+X<- train_set %>% group_by(movieId) %>%
+  mutate(b_i = mean(rating - train_mu)) %>% ungroup() %>%
+  group_by(userId) %>% mutate(b_u = mean(rating - train_mu - b_i)) %>% 
+  ungroup() %>%
+  mutate(intercept = 1) %>%
+  select(10, 12:41) %>%  # column 10 is film_year, 12 to 38 movie groups
+                         # and genres, 39, 40 and 41 - b_i, b_u and intercept
+  as.matrix()
+
+test_matrix<- test_set %>%
+  left_join(train_bi, by = "movieId") %>%
+  left_join(train_bu, by = "userId") %>%
+  mutate(intercept = 1) %>%
+  select(10, 12:41) %>%
+  as.matrix()
+
+betahats<- solve(crossprod(X)) %*% crossprod(X, y) 
+
+predicted_ratings<- test_matrix %*% betahats
+
+rmse<- RMSE(true_ratings = true_ratings, predicted_ratings = predicted_ratings)
+
+models<- rbind(models, c("LSE Mu + Movie Bias + User Bias", rmse))
+
+remove(X, test_matrix, predicted_ratings, rmse,train_bi,train_bu)
+
+models
+```
+
+There is a reduction in LSE model also, but the difference between the naive and LSE Mu model's reduces. This is not unexpected as the user's and movie's own average rating is the biggest determinant of predicted rating. This can be appreciated by looking at the betahats (estimates) below. The user and movie bias has the biggest coefficients and that of other predictors as drastically reduced when compared to previous models without bias.
+Nevertheless, the LSE model performed better than the naive model and RMSE is also less than the targeted RMSE of 0.86490.
+
+```{r lse with bias betahats}
+coef_names<- names(train_set)[c(10, 12:38)]
+coef_names<- c(coef_names, "b_i", "b_u", "intercept")
+dat<- data.frame(ceoffs_name = coef_names, estimate = betahats)
+dat %>% filter(estimate > 0.05 | estimate < - 0.03) %>% arrange(desc(abs(estimate)))
+remove(coef_names, dat, betahats)
+```
+
+The movie groups and genre will only add/reduce around 0.05 to the predicted rating and the b_i and b_u are the main determinant of predicted rating.
+
+## 3.4 Regularization
+
+Regularization was done on both the models using the penalty term (lamda's) from two to nine, increasing by one and the results are plotted.
+
+```{r Regularization}
+
+lamdas<- seq(2, 9, 1)
+
+rmses_lse_mu <- sapply(lamdas, function(l){
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - train_mu)/(n()+l))
+ 
+   b_u <- train_set %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - train_mu)/(n()+l))
+ 
+    X<- train_set %>% 
+    group_by(movieId) %>%
+    mutate(b_i = sum(rating - train_mu)/(n()+l)) %>%
+    ungroup() %>%
+    group_by(userId) %>% 
+    mutate(b_u = sum(rating - b_i - train_mu)/(n()+l)) %>% 
+    ungroup() %>%
+    mutate(intercept = 1)  %>%
+    select(10, 12:41) %>%
+    as.matrix()
+  
+  test_matrix<- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(intercept = 1)  %>%
+    select(10, 12:41) %>%
+    as.matrix() 
+  
+  betahats<- solve(crossprod(X)) %*% crossprod(X, y) 
+  
+  predicted_ratings<- test_matrix %*% betahats
+  
+  return(RMSE(true_ratings = true_ratings, predicted_ratings = predicted_ratings))
+})
+
+rmses_naive_mu <- sapply(lamdas, function(l){
+  
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - train_mu)/(n()+l))
+  
+  b_u <- train_set %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - train_mu)/(n()+l))
+  
+  predicted_ratings <-
+    test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = train_mu + b_i + b_u) %>%
+    pull(pred)
+  return(RMSE(true_ratings = true_ratings, predicted_ratings = predicted_ratings))
+})
+
+rmses_dat<- data.frame(lamdas = lamdas, rmses_lse_mu = rmses_lse_mu,
+                       rmses_naive_mu = rmses_naive_mu)
+
+remove(rmses_naive_mu, rmses_lse_mu, lamdas)
+
+rmses_dat %>% gather("Method", "RMSE", - lamdas) %>% 
+  mutate(Method = factor(Method, labels = c("LSE Mu", "Naive Mu"))) %>%
+  ggplot(aes(x = lamdas, y = RMSE, col = Method)) +
+  geom_point() + theme_minimal()
+
+remove(rmses_dat)
+```
+
+The residual mean square error of both model reduce equally and the one using LSE Mu perform better than the Naive Mu. The best lamda was 5. 
+
+
+## 3.5 Training the final model using enire edx dataset
+
+The linear regression model with predictors - film_1980, movie groups 1 through 8, all the genres, regularized user and movie bias with the penalty term (lamda = 5) will be final model for testing with validation set.
+
+The betahats, movie bias (b_i) and the user's bias (b_u) are calculated on the entire edx dataset. 
+
+```{r estimation edx betahat b_i b_u}
+lamda<- 5
+
+edx_mu<- mean(edx$rating)
+
+y<- edx$rating
+
+edx_b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - edx_mu)/(n()+lamda))
+
+edx_b_u <- edx %>%
+  left_join(edx_b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - edx_mu)/(n()+lamda))
+
+X<- edx %>% 
+  group_by(movieId) %>%
+  mutate(b_i = sum(rating - edx_mu)/(n()+lamda)) %>%
+  ungroup() %>%
+  group_by(userId) %>% 
+  mutate(b_u = sum(rating - b_i - edx_mu)/(n()+lamda)) %>% 
+  ungroup() %>%
+  mutate(intercept = 1)  %>%
+  select(10, 12:41) %>%
+  as.matrix() 
+
+edx_betahats<- solve(crossprod(X)) %*% crossprod(X, y)
+
+remove(X, y, edx_mu, edx, lamda)
+```
+
+## 3.7 Data wrangling of validation set and testing of the final model
+
+The column variables created for edx dataset will be created for the validation set and the **Final RMSE** on the validation set is computed in this section.
+
+```{r validation set wrangling}
+
+validation<- validation %>% mutate(rating_year = year(as_datetime(timestamp)), 
+                     day_week = weekdays(as_datetime(timestamp)))  
+
+
+validation<- validation %>% mutate(film_year = str_extract(title, pattern = film_year_pattern)) %>% 
+  mutate(film_year = str_remove(film_year, pattern = "\\(")) %>%        
+  mutate(film_year = as.numeric(str_remove(film_year, pattern = "\\)")))
+
+validation<- validation %>% mutate(film_1980 = ifelse(film_year > 1980, 1, 0))
+
+validation<- validation %>% mutate(groups = case_when(
+  title %in% g1 ~ "Group 1",
+  title %in% g2 ~ "Group 2",
+  title %in% g3 ~ "Group 3",
+  title %in% g4 ~ "Group 4",
+  title %in% g5 ~ "Group 5",
+  title %in% g6 ~ "Group 6",
+  title %in% g7 ~ "Group 7",
+  title %in% g8 ~ "Group 8"
+))
+
+validation<- validation %>% mutate(groups = factor(ifelse(is.na(groups), "Group 0", groups)))
+
+validation<- validation %>%
+  mutate(group1 = ifelse(title %in% g1, 1, 0),
+         group2 = ifelse(title %in% g2, 1, 0),
+         group3 = ifelse(title %in% g3, 1, 0),
+         group4 = ifelse(title %in% g4, 1, 0),
+         group5 = ifelse(title %in% g5, 1, 0),
+         group6 = ifelse(title %in% g6, 1, 0),
+         group7 = ifelse(title %in% g7, 1, 0),
+         group8 = ifelse(title %in% g8, 1, 0))
+
+
+validation<- validation %>% mutate(comedy = ifelse(str_detect(genres, pattern = "Comedy"), 1, 0), 
+                     romance = ifelse(str_detect(genres, pattern = "Romance"), 1, 0), 
+                     action = ifelse(str_detect(genres, pattern = "Action"), 1, 0), 
+                     crime = ifelse(str_detect(genres, pattern = "Crime"), 1, 0),
+                     thriller = ifelse(str_detect(genres, pattern = "Thriller"), 1, 0),
+                     drama = ifelse(str_detect(genres, pattern = "Drama"), 1, 0),
+                     sci_fi = ifelse(str_detect(genres, pattern = "Sci-Fi"), 1, 0),
+                     adventure = ifelse(str_detect(genres, pattern = "Adventure"), 1, 0),
+                     children = ifelse(str_detect(genres, pattern = "Children"), 1, 0),
+                     fantasy = ifelse(str_detect(genres, pattern = "Fantasy"), 1, 0),
+                     war = ifelse(str_detect(genres, pattern = "War"), 1, 0),
+                     animation = ifelse(str_detect(genres, pattern = "Animation"), 1, 0),
+                     musical = ifelse(str_detect(genres, pattern = "Musical"), 1, 0),
+                     western = ifelse(str_detect(genres, pattern = "Western"), 1, 0),
+                     mystery = ifelse(str_detect(genres, pattern = "Mystery"), 1, 0),
+                     film_noir = ifelse(str_detect(genres, pattern = "Film-Noir"), 1, 0),
+                     horror = ifelse(str_detect(genres, pattern = "Horror"), 1, 0),
+                     documentary = ifelse(str_detect(genres, pattern = "Documentary"), 1, 0),
+                     imax = ifelse(str_detect(genres, pattern = "IMAX"), 1, 0))
+```
+
+```{r final rmse, echo=TRUE}
+
+validation_matrix<- validation %>%
+  left_join(edx_b_i, by = "movieId") %>%
+  left_join(edx_b_u, by = "userId") %>%
+  mutate(intercept = 1)  %>%
+  select(10, 12:41) %>%
+  as.matrix() 
+
+colnames(validation_matrix)
+
+predicted_ratings<- validation_matrix %*% edx_betahats
+
+Final_RMSE<- RMSE(true_ratings = validation$rating, predicted_ratings = predicted_ratings)
+
+Final_RMSE
+```
+
+# 4. Conclusion
+
+The goal of this assignment was to build a model that reduces error for predicted rating. Recommendation system is a useful data to have for many industries and is allows for personalized user's experience.
+
+For this assignment, several new features/variables were created from the data and their relationship with rating was studied and modeled. Linear regression with film year (movies before or after 1980), movie clusters identified by Hierarchical clustering analysis, 19 genre(s) and regularized movie and user bias was used as predictors. The final RMSE on the validation set was **0.8646087**.
+
+## Limitations
+
+There are several limitations in this model. A few listed below
+
++ The clustering analysis done here will not be perfect, as all user's did not rate all movies. The Dist function calculates correlation on complete pairwise observation, thereby reducing the number used in each correlation distance
++ The user' s were not grouped for this model
++ The model assumed a additive relationship between all the predictors and interaction, if any was not tested and accounted for
++ There might be several other data structures this model did not factor in. Example - Do a user rating's decline after sometime etc..
+
+Matrix factorization could have offset several of these limitation-  it assigns a rating for movie for which a user has not given rating, thereby eliminating missing values. Matrix factorization followed by Principal Component analysis could have captured the resdiuals which represents both user and movies groupings.
+
